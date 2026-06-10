@@ -1,0 +1,11 @@
+data/
+spectrum_bands/
+test_set/
+test_set.zip
+venv/
+__pycache__/
+outputs/
+checkpoints/
+logs/
+.ipynb_checkpoints/
+*.pyc

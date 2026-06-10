@@ -1,0 +1,13 @@
+injector,severity,n_files,n_detected,recall,mean_score
+narrowband_jammer,subtle,5,5,1.0,-14.1516
+narrowband_jammer,moderate,5,5,1.0,-14.1516
+narrowband_jammer,obvious,5,5,1.0,-14.1516
+barrage_jammer,subtle,5,5,1.0,-14.1352
+barrage_jammer,moderate,5,5,1.0,-14.1516
+barrage_jammer,obvious,5,5,1.0,-14.1516
+rogue_carrier,subtle,5,5,1.0,-14.1516
+rogue_carrier,moderate,5,5,1.0,-14.1516
+rogue_carrier,obvious,4,4,1.0,-14.1516
+gradual_drift,subtle,5,5,1.0,-14.1516
+gradual_drift,moderate,5,5,1.0,-14.1516
+gradual_drift,obvious,5,5,1.0,-14.1516

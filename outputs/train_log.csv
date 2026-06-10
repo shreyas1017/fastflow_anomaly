@@ -1,0 +1,2 @@
+epoch,train_nll,val_nll,lr,backbone_frozen,epoch_time_s
+1,-3.738428,-4.834164,0.00099901,Y,23044.0

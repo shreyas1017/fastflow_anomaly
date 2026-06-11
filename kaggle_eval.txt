@@ -1,0 +1,277 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# KAGGLE PER-BAND EVALUATION CELL
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Run this AFTER training completes (or in a new session with the
+# checkpoint attached as a dataset).
+#
+# Prerequisites:
+#   - model.py accessible (same "fastflow" dataset from training)
+#   - Test data: attach your test set dataset containing normal/ and anomalous/
+#   - Checkpoint: either from the just-completed training output, or
+#     uploaded as a Kaggle dataset
+#
+# ═══════════════════════════════════════════════════════════════════════════
+
+BAND = "FM"   # Must match the checkpoint you're evaluating
+
+import sys, os, re, gc, glob, json, math
+import numpy as np
+import torch
+import torch.nn as nn
+from pathlib import Path
+from sklearn.metrics import roc_auc_score, average_precision_score
+
+# ── Find model.py ──
+model_paths = glob.glob('/kaggle/input/**/model.py', recursive=True)
+if not model_paths:
+    raise FileNotFoundError("Could not find model.py! Attach the fastflow dataset.")
+sys.path.insert(0, os.path.dirname(model_paths[0]))
+from model import FastFlow
+
+# ── Find checkpoint ──
+# Priority: 1) just-trained output, 2) attached dataset
+ckpt_candidates = [
+    Path(f"/kaggle/working/checkpoints/best.pt"),        # from training cell
+    Path(f"/kaggle/working/{BAND}_best.pt"),              # copied output
+]
+# Also search attached datasets
+ckpt_candidates += [Path(p) for p in glob.glob('/kaggle/input/**/*best*.pt', recursive=True)]
+
+CKPT_PATH = None
+for c in ckpt_candidates:
+    if c.exists():
+        CKPT_PATH = c
+        break
+
+if CKPT_PATH is None:
+    raise FileNotFoundError("No checkpoint found! Train first or attach checkpoint dataset.")
+
+# ── Find test data ──
+# Search for normal/ and anomalous/ directories
+test_normal_dirs = glob.glob('/kaggle/input/**/normal', recursive=True)
+test_anom_dirs = glob.glob('/kaggle/input/**/anomalous', recursive=True)
+
+# Filter to dirs that actually contain .npy files
+test_normal_dirs = [d for d in test_normal_dirs if glob.glob(os.path.join(d, '*.npy'))]
+test_anom_dirs = [d for d in test_anom_dirs if glob.glob(os.path.join(d, '*.npy'))]
+
+if not test_normal_dirs:
+    raise FileNotFoundError("Could not find normal/ test directory with .npy files!")
+if not test_anom_dirs:
+    raise FileNotFoundError("Could not find anomalous/ test directory with .npy files!")
+
+NORMAL_DIR = Path(test_normal_dirs[0])
+ANOM_DIR = Path(test_anom_dirs[0])
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+print(f"Band       : {BAND}")
+print(f"Device     : {device}")
+print(f"Checkpoint : {CKPT_PATH}")
+print(f"Normal dir : {NORMAL_DIR}")
+print(f"Anomalous  : {ANOM_DIR}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Config (must match training)
+# ═══════════════════════════════════════════════════════════════════════════
+
+PATCH_H, PATCH_W = 32, 32
+STRIDE_H, STRIDE_W = 16, 16
+MAX_EDGE_FRAC = 0.20
+CLIP_VAL = 5.0
+
+
+def extract_band(fname):
+    m = re.search(r'_(fm|gsm|lte|dab|dvbt|tetra)_', fname.lower())
+    return m.group(1).upper() if m else "UNKNOWN"
+
+
+def normalize(arr, stats):
+    normed = (arr - stats["median"]) / stats["iqr"]
+    return np.clip(normed, -CLIP_VAL, CLIP_VAL).astype(np.float32)
+
+
+def extract_patches(arr):
+    T, F = arr.shape
+    if T < PATCH_H or F < PATCH_W:
+        return np.empty((0, PATCH_H, PATCH_W), dtype=np.float32)
+    patches = []
+    for i in range((T - PATCH_H) // STRIDE_H + 1):
+        for j in range((F - PATCH_W) // STRIDE_W + 1):
+            p = arr[i*STRIDE_H : i*STRIDE_H+PATCH_H,
+                    j*STRIDE_W : j*STRIDE_W+PATCH_W]
+            if (np.abs(p) >= CLIP_VAL - 1e-4).sum() / p.size <= MAX_EDGE_FRAC:
+                patches.append(p.copy())
+    return np.stack(patches) if patches else np.empty((0, PATCH_H, PATCH_W), dtype=np.float32)
+
+
+def score_file(model, fpath, norm_stats, device, batch_size=1024):
+    """Score a single .npy file. Returns (file_score, n_patches) or None."""
+    arr = np.load(fpath).astype(np.float32)
+    if arr.ndim != 2 or arr.shape[0] < 10 or arr.shape[1] < 2:
+        return None
+    normed = normalize(arr, norm_stats)
+    patches = extract_patches(normed)
+    if len(patches) == 0:
+        return None
+
+    patches_t = torch.from_numpy(patches).unsqueeze(1).to(device)
+    scores_list = []
+    with torch.no_grad():
+        for b in range(0, len(patches_t), batch_size):
+            batch = patches_t[b:b + batch_size]
+            batch_scores = model.anomaly_score(batch).cpu().numpy()
+            scores_list.append(batch_scores)
+
+    scores = np.concatenate(scores_list)
+    # Top-1% pooling (minimum 5 patches)
+    k = max(5, int(0.01 * len(scores)))
+    file_score = float(np.mean(np.sort(scores)[-k:]))
+    return file_score, len(patches)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Load Model
+# ═══════════════════════════════════════════════════════════════════════════
+
+print(f"\nLoading checkpoint: {CKPT_PATH}")
+ckpt = torch.load(CKPT_PATH, map_location=device, weights_only=False)
+
+flow_layers = ckpt.get("arch", {}).get("flow_layers", 16)
+flow_hidden = ckpt.get("arch", {}).get("flow_hidden_ratio", 128.0)
+norm_stats = ckpt["norm_stats"]
+
+print(f"  Epoch    : {ckpt.get('epoch', '?')}")
+print(f"  Val NLL  : {ckpt.get('val_nll', '?'):.4f}")
+print(f"  Norm     : median={norm_stats['median']:.2f}, iqr={norm_stats['iqr']:.2f}")
+
+model = FastFlow(flow_layers=flow_layers, flow_hidden_ratio=flow_hidden)
+
+# Strip 'model.' prefix from DataParallel checkpoints
+state_dict = ckpt["model_state"]
+clean = {}
+for k, v in state_dict.items():
+    new_key = k.replace("model.", "") if k.startswith("model.") else k
+    clean[new_key] = v
+model.load_state_dict(clean)
+model.to(device)
+model.eval()
+print("  Model loaded successfully.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Score Test Files
+# ═══════════════════════════════════════════════════════════════════════════
+
+results = []
+
+# ── Normal files ──
+normal_files = sorted(NORMAL_DIR.glob("*.npy"))
+band_normal = [f for f in normal_files if extract_band(f.name) == BAND]
+print(f"\nScoring {len(band_normal)} normal {BAND} files...")
+
+for fpath in band_normal:
+    result = score_file(model, fpath, norm_stats, device)
+    if result is None:
+        print(f"  SKIP: {fpath.name}"); continue
+    score, n_patches = result
+    results.append({"filename": fpath.name, "label": 0, "score": score,
+                     "n_patches": n_patches, "type": "normal", "severity": "none"})
+    print(f"  NORMAL  {score:>10.2f}  ({n_patches:>5} patches)  {fpath.name}")
+
+# ── Anomalous files ──
+anom_files = sorted(ANOM_DIR.glob("*.npy"))
+band_anom = [f for f in anom_files if extract_band(f.name) == BAND]
+print(f"\nScoring {len(band_anom)} anomalous {BAND} files...")
+
+for fpath in band_anom:
+    result = score_file(model, fpath, norm_stats, device)
+    if result is None:
+        print(f"  SKIP: {fpath.name}"); continue
+    score, n_patches = result
+
+    atype, severity = "unknown", "unknown"
+    m = re.search(r"__(barrage_jammer|narrowband_jammer|rogue_carrier|gradual_drift)__(subtle|moderate|obvious)__", fpath.name)
+    if m:
+        atype, severity = m.group(1), m.group(2)
+
+    results.append({"filename": fpath.name, "label": 1, "score": score,
+                     "n_patches": n_patches, "type": atype, "severity": severity})
+    print(f"  ANOM    {score:>10.2f}  ({n_patches:>5} patches)  [{atype}/{severity}]  {fpath.name}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Compute & Display Metrics
+# ═══════════════════════════════════════════════════════════════════════════
+
+if not results:
+    print("\nNo files scored!")
+else:
+    labels = np.array([r["label"] for r in results])
+    scores = np.array([r["score"] for r in results])
+    n_normal = (labels == 0).sum()
+    n_anom = (labels == 1).sum()
+
+    if n_normal == 0 or n_anom == 0:
+        print(f"\nCannot compute AUROC: {n_normal} normal, {n_anom} anomalous.")
+    else:
+        auroc = roc_auc_score(labels, scores)
+        ap = average_precision_score(labels, scores)
+
+        print(f"\n{'═' * 55}")
+        print(f"  [{BAND}] EVALUATION RESULTS")
+        print(f"{'═' * 55}")
+        print(f"  Normal files     : {n_normal}")
+        print(f"  Anomalous files  : {n_anom}")
+        print(f"  AUROC            : {auroc:.4f}")
+        print(f"  Average Precision: {ap:.4f}")
+
+        # Score distribution
+        normal_scores = scores[labels == 0]
+        anom_scores = scores[labels == 1]
+        print(f"\n  Score Distribution:")
+        print(f"    Normal    : mean={normal_scores.mean():.2f}, "
+              f"std={normal_scores.std():.2f}, "
+              f"range=[{normal_scores.min():.2f}, {normal_scores.max():.2f}]")
+        print(f"    Anomalous : mean={anom_scores.mean():.2f}, "
+              f"std={anom_scores.std():.2f}, "
+              f"range=[{anom_scores.min():.2f}, {anom_scores.max():.2f}]")
+
+        # Per-severity breakdown
+        print(f"\n  Per-Severity Breakdown:")
+        print(f"  {'Severity':<12} {'Count':>6} {'Mean Score':>12} {'AUROC':>8}")
+        print(f"  {'-'*42}")
+        for sev in ["subtle", "moderate", "obvious"]:
+            sev_mask = np.array([r["severity"] == sev for r in results])
+            normal_mask = labels == 0
+            if sev_mask.sum() > 0:
+                sev_scores = scores[sev_mask]
+                subset = sev_mask | normal_mask
+                sev_auroc = roc_auc_score(labels[subset], scores[subset])
+                print(f"  {sev:<12} {sev_mask.sum():>6} {sev_scores.mean():>12.2f} {sev_auroc:>8.4f}")
+
+        # Per-attack-type breakdown
+        print(f"\n  Per-Attack-Type Breakdown:")
+        print(f"  {'Attack Type':<22} {'Count':>6} {'Mean Score':>12} {'AUROC':>8}")
+        print(f"  {'-'*52}")
+        for atype in ["barrage_jammer", "narrowband_jammer", "rogue_carrier", "gradual_drift"]:
+            type_mask = np.array([r["type"] == atype for r in results])
+            normal_mask = labels == 0
+            if type_mask.sum() > 0:
+                type_scores = scores[type_mask]
+                subset = type_mask | normal_mask
+                type_auroc = roc_auc_score(labels[subset], scores[subset])
+                print(f"  {atype:<22} {type_mask.sum():>6} {type_scores.mean():>12.2f} {type_auroc:>8.4f}")
+
+        print(f"\n{'═' * 55}")
+
+    # Save detailed results
+    import csv
+    out_path = f"/kaggle/working/{BAND}_eval_results.csv"
+    with open(out_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["filename", "label", "score", "n_patches", "type", "severity"])
+        writer.writeheader()
+        writer.writerows(results)
+    print(f"\nDetailed scores saved to: {out_path}")

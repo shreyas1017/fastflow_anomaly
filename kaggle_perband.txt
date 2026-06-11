@@ -59,7 +59,7 @@ n_gpus = torch.cuda.device_count()
 if torch.cuda.is_available():
     for i in range(n_gpus):
         props = torch.cuda.get_device_properties(i)
-        print(f"  GPU {i}: {props.name} ({props.total_mem / 1e9:.1f} GB)")
+        print(f"  GPU {i}: {props.name} ({props.total_memory / 1e9:.1f} GB)")
 
 print(f"Device : {device}")
 print(f"GPUs   : {n_gpus}")

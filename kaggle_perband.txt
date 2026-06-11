@@ -1,0 +1,406 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# KAGGLE PER-BAND FASTFLOW TRAINING NOTEBOOK
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Instructions:
+#   1. Attach these Kaggle datasets:
+#      - "spectrum-npy-data" (your 228 .npy training files)
+#      - "fastflow"          (model.py from the repo)
+#   2. Set BAND below to the band you want to train.
+#   3. Enable GPU (Settings → Accelerator → GPU T4 x2).
+#   4. Run all cells. Training takes ~1-3 hours depending on band size.
+#   5. Download best.pt from the Output panel.
+#   6. Repeat for each band (FM, GSM, LTE, DAB, DVBT, TETRA).
+#
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ┌─────────────────────────────────────────────┐
+# │  CHANGE THIS TO TRAIN A DIFFERENT BAND      │
+# └─────────────────────────────────────────────┘
+BAND = "FM"   # One of: FM, GSM, LTE, DAB, DVBT, TETRA
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CELL 1: Setup & Imports
+# ═══════════════════════════════════════════════════════════════════════════
+
+import sys, os, re, gc, glob, json, time, math
+import numpy as np
+import torch
+import torch.nn as nn
+from pathlib import Path
+from torch.utils.data import DataLoader, TensorDataset, random_split
+
+# Find model.py dynamically
+model_paths = glob.glob('/kaggle/input/**/model.py', recursive=True)
+if not model_paths:
+    raise FileNotFoundError("Could not find model.py in any attached dataset!")
+FASTFLOW_PATH = os.path.dirname(model_paths[0])
+sys.path.insert(0, FASTFLOW_PATH)
+from model import FastFlow
+
+# Find training data directory
+data_candidates = glob.glob('/kaggle/input/**/data', recursive=True)
+if not data_candidates:
+    # Fall back: search for any .npy files
+    npy_files = glob.glob('/kaggle/input/**/*.npy', recursive=True)
+    if not npy_files:
+        raise FileNotFoundError("No .npy files found in /kaggle/input!")
+    DATA_ROOT = Path(os.path.dirname(npy_files[0]))
+else:
+    DATA_ROOT = Path(data_candidates[0])
+
+OUT_DIR = Path("/kaggle/working/checkpoints")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+n_gpus = torch.cuda.device_count()
+if torch.cuda.is_available():
+    for i in range(n_gpus):
+        props = torch.cuda.get_device_properties(i)
+        print(f"  GPU {i}: {props.name} ({props.total_mem / 1e9:.1f} GB)")
+
+print(f"Device : {device}")
+print(f"GPUs   : {n_gpus}")
+print(f"BAND   : {BAND}")
+print(f"Data   : {DATA_ROOT}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CELL 2: Config & Helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Architecture
+FLOW_LAYERS = 16
+FLOW_HIDDEN = 128
+
+# Training
+N_EPOCHS    = 50
+LR          = 1e-3
+WEIGHT_DECAY = 1e-5
+GRAD_CLIP   = 1.0
+SAVE_EVERY  = 10
+
+# Patching
+PATCH_H, PATCH_W = 32, 32
+STRIDE_H, STRIDE_W = 16, 16
+MAX_EDGE_FRAC = 0.20
+CLIP_VAL = 5.0
+MAX_PATCHES_PER_FILE = 2000
+VAL_FRACTION = 0.1
+SEED = 42
+
+
+def extract_band(fname):
+    m = re.search(r'_(fm|gsm|lte|dab|dvbt|tetra)_', fname.lower())
+    return m.group(1).upper() if m else "UNKNOWN"
+
+
+def compute_band_stats(file_paths):
+    all_samples = []
+    for p in file_paths:
+        arr = np.load(p).astype(np.float32)
+        all_samples.append(arr.flatten()[::4])
+    all_vals = np.concatenate(all_samples)
+    median = float(np.median(all_vals))
+    q25, q75 = np.percentile(all_vals, [25, 75])
+    iqr = float(q75 - q25) if (q75 - q25) > 0 else 1.0
+    return {"median": median, "iqr": iqr}
+
+
+def normalize(arr, stats):
+    normed = (arr - stats["median"]) / stats["iqr"]
+    return np.clip(normed, -CLIP_VAL, CLIP_VAL).astype(np.float32)
+
+
+def extract_patches(arr):
+    T, F = arr.shape
+    if T < PATCH_H or F < PATCH_W:
+        return np.empty((0, PATCH_H, PATCH_W), dtype=np.float32)
+    patches = []
+    for i in range((T - PATCH_H) // STRIDE_H + 1):
+        for j in range((F - PATCH_W) // STRIDE_W + 1):
+            p = arr[i*STRIDE_H : i*STRIDE_H+PATCH_H,
+                    j*STRIDE_W : j*STRIDE_W+PATCH_W]
+            if (np.abs(p) >= CLIP_VAL - 1e-4).sum() / p.size <= MAX_EDGE_FRAC:
+                patches.append(p.copy())
+    return np.stack(patches) if patches else np.empty((0, PATCH_H, PATCH_W), dtype=np.float32)
+
+
+class FastFlowDP(nn.Module):
+    """Thin wrapper so DataParallel calls forward() returning per-sample NLL."""
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, x):
+        return self.model.flow.nll(x)  # (B,)
+
+
+def unwrap(m):
+    return m.module if isinstance(m, nn.DataParallel) else m
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CELL 3: Load & Patch Data (Band-Filtered)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Find all .npy files and filter to this band only
+all_npy = sorted(DATA_ROOT.rglob("*.npy"))
+band_files = [f for f in all_npy if extract_band(f.name) == BAND]
+
+print(f"\n[{BAND}] Found {len(band_files)} files (out of {len(all_npy)} total)")
+
+if len(band_files) == 0:
+    raise RuntimeError(f"No files found for band {BAND}! Check DATA_ROOT: {DATA_ROOT}")
+
+# Compute band-specific normalization stats
+print("Computing normalization stats...")
+norm_stats = compute_band_stats(band_files)
+print(f"  median={norm_stats['median']:.2f}, iqr={norm_stats['iqr']:.2f}")
+
+# Extract patches
+rng = np.random.default_rng(SEED)
+all_patches_list = []
+skipped = 0
+
+print(f"Extracting patches from {len(band_files)} files...")
+for i, fpath in enumerate(band_files):
+    arr = np.load(fpath).astype(np.float32)
+    if arr.ndim != 2 or arr.shape[0] < 10 or arr.shape[1] < 2:
+        skipped += 1; continue
+    if not np.isfinite(arr).all():
+        skipped += 1; continue
+
+    normed = normalize(arr, norm_stats)
+    patches = extract_patches(normed)
+
+    if patches.shape[0] == 0:
+        skipped += 1; continue
+    if patches.shape[0] > MAX_PATCHES_PER_FILE:
+        idx = rng.choice(patches.shape[0], MAX_PATCHES_PER_FILE, replace=False)
+        patches = patches[idx]
+
+    all_patches_list.append(patches)
+
+if not all_patches_list:
+    raise RuntimeError("No patches loaded!")
+
+all_patches = np.concatenate(all_patches_list, axis=0)
+del all_patches_list; gc.collect()
+print(f"\nTotal patches: {all_patches.shape[0]:,} | Skipped: {skipped}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CELL 4: Model & DataLoaders
+# ═══════════════════════════════════════════════════════════════════════════
+
+raw_model = FastFlow(flow_layers=FLOW_LAYERS, flow_hidden_ratio=float(FLOW_HIDDEN)).to(device)
+model = FastFlowDP(raw_model).to(device)
+
+if n_gpus >= 2:
+    model = nn.DataParallel(model)
+    BATCH = 512
+    print(f"DataParallel active — {n_gpus} GPUs, batch={BATCH}")
+else:
+    BATCH = 256
+    print(f"Single GPU mode — batch={BATCH}")
+
+total_params = sum(p.numel() for p in model.parameters())
+print(f"Total params: {total_params:,}")
+
+# DataLoaders
+tensor = torch.from_numpy(all_patches)
+del all_patches; gc.collect()
+
+n_val = max(1, int(VAL_FRACTION * len(tensor)))
+ds = TensorDataset(tensor)
+train_ds, val_ds = random_split(
+    ds, [len(tensor) - n_val, n_val],
+    generator=torch.Generator().manual_seed(SEED)
+)
+
+train_loader = DataLoader(train_ds, batch_size=BATCH, shuffle=True,
+                          num_workers=4, pin_memory=True, drop_last=True,
+                          persistent_workers=True, prefetch_factor=3)
+val_loader = DataLoader(val_ds, batch_size=BATCH, shuffle=False,
+                        num_workers=4, pin_memory=True,
+                        persistent_workers=True, prefetch_factor=3)
+
+print(f"Train: {len(train_ds):,} | Val: {len(val_ds):,} | Batches/ep: {len(train_loader)}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CELL 5: Sanity Check (3 quick epochs)
+# ═══════════════════════════════════════════════════════════════════════════
+
+raw = unwrap(model).model
+flow_pars = list(raw.parameters())
+test_opt = torch.optim.AdamW(flow_pars, lr=LR, weight_decay=WEIGHT_DECAY)
+
+# Use small subset for sanity check
+mini_train = list(train_loader)[:5]
+mini_val = list(val_loader)[:3]
+
+print(f"\nSanity check (3 epochs on {len(mini_train)} batches)...")
+print(f" Ep   Train NLL    Val NLL   grad_norm    Time")
+print("-" * 50)
+
+passed = True
+for epoch in range(1, 4):
+    t0 = time.time()
+    model.train()
+    train_loss, n_train, last_gnorm = 0.0, 0, 0.0
+
+    for (patches,) in mini_train:
+        patches = patches.unsqueeze(1).to(device, non_blocking=True)
+        test_opt.zero_grad(set_to_none=True)
+        loss = model(patches).mean()
+        if not torch.isfinite(loss):
+            print("  !! non-finite — skipping"); continue
+        loss.backward()
+        last_gnorm = nn.utils.clip_grad_norm_(flow_pars, 1.0).item()
+        test_opt.step()
+        train_loss += loss.item(); n_train += 1
+
+    model.eval()
+    val_loss, n_val = 0.0, 0
+    with torch.no_grad():
+        for (patches,) in mini_val:
+            patches = patches.unsqueeze(1).to(device, non_blocking=True)
+            v = model(patches).mean()
+            if torch.isfinite(v): val_loss += v.item(); n_val += 1
+
+    train_nll = train_loss / max(n_train, 1)
+    val_nll = val_loss / max(n_val, 1)
+    print(f"{epoch:>3}  {train_nll:>10.4f}  {val_nll:>9.4f}  "
+          f"{last_gnorm:>10.4f}  {time.time()-t0:>5.1f}s")
+
+    if epoch == 1:
+        if val_nll <= -14.15:
+            print("  FAIL — collapsed to constant.")
+            passed = False; break
+        if last_gnorm < 1e-6:
+            print("  FAIL — grad_norm = 0.")
+            passed = False; break
+        print(f"  OK: val_nll={val_nll:.4f}, grad_norm={last_gnorm:.4f}")
+
+if passed:
+    print(f"\nPASSED — safe to run full training.")
+
+del mini_train, mini_val, test_opt
+gc.collect(); torch.cuda.empty_cache()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CELL 6: Full Training
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Re-initialize optimizer (sanity check dirtied the weights)
+raw_model2 = FastFlow(flow_layers=FLOW_LAYERS, flow_hidden_ratio=float(FLOW_HIDDEN)).to(device)
+model2 = FastFlowDP(raw_model2).to(device)
+if n_gpus >= 2:
+    model2 = nn.DataParallel(model2)
+
+raw2 = unwrap(model2).model
+flow_params = list(raw2.parameters())
+optimizer = torch.optim.AdamW(flow_params, lr=LR, weight_decay=WEIGHT_DECAY)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS, eta_min=0)
+
+best_val = float("inf")
+history = {"train_nll": [], "val_nll": [], "lr": [], "epoch_time": []}
+
+print(f"\nTraining [{BAND}]: {N_EPOCHS} epochs, LR={LR:.1e}, batch={BATCH}")
+print(f"\n Ep   Train NLL    Val NLL         LR     Time  Note")
+print("-" * 60)
+
+for epoch in range(1, N_EPOCHS + 1):
+    t0 = time.time()
+
+    # Train
+    model2.train()
+    train_loss, n_train = 0.0, 0
+    for (patches,) in train_loader:
+        patches = patches.unsqueeze(1).to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        loss = model2(patches).mean()
+        if not torch.isfinite(loss):
+            continue
+        loss.backward()
+        nn.utils.clip_grad_norm_(flow_params, GRAD_CLIP)
+        optimizer.step()
+        train_loss += loss.item()
+        n_train += 1
+
+    scheduler.step()
+
+    # Validation
+    model2.eval()
+    val_loss, n_val = 0.0, 0
+    with torch.no_grad():
+        for (patches,) in val_loader:
+            patches = patches.unsqueeze(1).to(device, non_blocking=True)
+            v = model2(patches).mean()
+            if torch.isfinite(v):
+                val_loss += v.item()
+                n_val += 1
+
+    train_nll = train_loss / max(n_train, 1)
+    val_nll = val_loss / max(n_val, 1)
+    epoch_time = time.time() - t0
+    cur_lr = optimizer.param_groups[0]["lr"]
+    note = ""
+
+    # Checkpoint
+    ckpt_data = {
+        "band":        BAND,
+        "epoch":       epoch,
+        "val_nll":     val_nll,
+        "train_nll":   train_nll,
+        "model_state": raw2.state_dict(),
+        "arch":        {"flow_layers": FLOW_LAYERS, "flow_hidden_ratio": float(FLOW_HIDDEN)},
+        "norm_stats":  norm_stats,
+        "optimizer":   optimizer.state_dict(),
+        "scheduler":   scheduler.state_dict(),
+    }
+
+    if val_nll < best_val:
+        best_val = val_nll
+        torch.save(ckpt_data, OUT_DIR / "best.pt")
+        note = "* best"
+
+    if epoch % SAVE_EVERY == 0:
+        torch.save(ckpt_data, OUT_DIR / f"ckpt_ep{epoch:03d}.pt")
+
+    history["train_nll"].append(train_nll)
+    history["val_nll"].append(val_nll)
+    history["lr"].append(cur_lr)
+    history["epoch_time"].append(epoch_time)
+
+    print(f"{epoch:>3}  {train_nll:>10.4f}  {val_nll:>9.4f}  "
+          f"{cur_lr:>9.2e}  {epoch_time:>6.1f}s  {note}")
+
+with open(OUT_DIR / "history.json", "w") as f:
+    json.dump(history, f)
+
+print(f"\nDone. Best val NLL: {best_val:.4f}")
+print(f"Avg epoch time: {np.mean(history['epoch_time']):.1f}s")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CELL 7: Save for Download
+# ═══════════════════════════════════════════════════════════════════════════
+
+import shutil
+
+ckpt_path = OUT_DIR / "best.pt"
+if ckpt_path.exists():
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    print(f"Best checkpoint: band={ckpt['band']}, epoch={ckpt['epoch']}, val_nll={ckpt['val_nll']:.4f}")
+    print(f"Norm stats: median={ckpt['norm_stats']['median']:.2f}, iqr={ckpt['norm_stats']['iqr']:.2f}")
+    print(f"File size: {ckpt_path.stat().st_size / 1e6:.1f} MB")
+    shutil.copy(ckpt_path, f"/kaggle/working/{BAND}_best.pt")
+    print(f"Copied to /kaggle/working/{BAND}_best.pt — download from Output panel")
+else:
+    print("best.pt not found!")

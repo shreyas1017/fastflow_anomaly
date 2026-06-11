@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Evaluate a single per-band FastFlow model.
+Evaluate a single per-band CAE model.
 
 Usage:
     python scripts/evaluate_band.py --band FM
     python scripts/evaluate_band.py --band GSM --ckpt outputs/models/GSM/best.pt
 
-Loads the checkpoint (which has embedded norm_stats), scores all test files
-for that band, and reports AUROC and AP.
+Loads the checkpoint (which has embedded norm_stats and enc_channels),
+scores all test files for that band via reconstruction error,
+and reports AUROC and AP.
 """
 
 import argparse
@@ -22,7 +23,7 @@ from sklearn.metrics import roc_auc_score, average_precision_score
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
-from fastflow.model import FastFlow
+from fastflow.model import CAE
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -56,7 +57,7 @@ def extract_patches(arr):
 
 
 def score_file(model, fpath, norm_stats, device, batch_size=512):
-    """Score a single .npy file. Returns (file_score, n_patches) or None."""
+    """Score a single .npy file via reconstruction error. Returns (file_score, n_patches) or None."""
     arr = np.load(fpath).astype(np.float32)
     if arr.ndim != 2 or arr.shape[0] < 10 or arr.shape[1] < 2:
         return None
@@ -66,13 +67,13 @@ def score_file(model, fpath, norm_stats, device, batch_size=512):
     if len(patches) == 0:
         return None
 
-    patches_t = torch.from_numpy(patches).unsqueeze(1).to(device)
+    patches_t = torch.from_numpy(patches).unsqueeze(1).to(device)  # (N, 1, 32, 32)
 
     scores_list = []
     with torch.no_grad():
         for b in range(0, len(patches_t), batch_size):
             batch = patches_t[b:b + batch_size]
-            batch_scores = model.anomaly_score(batch).cpu().numpy()
+            batch_scores = model.reconstruction_error(batch).cpu().numpy()
             scores_list.append(batch_scores)
 
     scores = np.concatenate(scores_list)
@@ -85,7 +86,7 @@ def score_file(model, fpath, norm_stats, device, batch_size=512):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate per-band FastFlow model")
+    parser = argparse.ArgumentParser(description="Evaluate per-band CAE model")
     parser.add_argument("--band", type=str, required=True,
                         choices=["FM", "GSM", "LTE", "DAB", "DVBT", "TETRA"])
     parser.add_argument("--ckpt", type=str, default=None,
@@ -104,23 +105,16 @@ def main():
     print(f"Loading checkpoint: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
 
-    flow_layers = ckpt.get("arch", {}).get("flow_layers", 16)
-    flow_hidden = ckpt.get("arch", {}).get("flow_hidden_ratio", 128.0)
+    enc_channels = tuple(ckpt.get("enc_channels", (16, 32, 64, 32)))
     norm_stats = ckpt["norm_stats"]
 
     print(f"  Band: {ckpt.get('band', band)}, Epoch: {ckpt.get('epoch', '?')}")
-    print(f"  Val NLL: {ckpt.get('val_nll', '?')}")
+    print(f"  Val Loss: {ckpt.get('val_loss', '?')}")
     print(f"  Norm stats: median={norm_stats['median']:.2f}, iqr={norm_stats['iqr']:.2f}")
+    print(f"  enc_channels: {enc_channels}")
 
-    model = FastFlow(flow_layers=flow_layers, flow_hidden_ratio=flow_hidden)
-
-    # Strip 'model.' prefix from DataParallel checkpoints
-    state_dict = ckpt["model_state"]
-    clean = {}
-    for k, v in state_dict.items():
-        new_key = k.replace("model.", "") if k.startswith("model.") else k
-        clean[new_key] = v
-    model.load_state_dict(clean)
+    model = CAE(enc_channels=enc_channels)
+    model.load_state_dict(ckpt["model_state"])
     model.to(device)
     model.eval()
 
@@ -146,7 +140,7 @@ def main():
         score, n_patches = result
         results.append({"filename": fname, "label": 0, "score": score,
                         "n_patches": n_patches, "type": "normal", "severity": "none"})
-        print(f"  [{len(results)}] {fname}: {score:.2f} ({n_patches} patches)")
+        print(f"  [{len(results)}] {fname}: {score:.4f} ({n_patches} patches)")
 
     # Anomalous files
     anom_files = manifest["test_anomalous"]
@@ -170,7 +164,7 @@ def main():
 
         results.append({"filename": fname, "label": 1, "score": score,
                         "n_patches": n_patches, "type": atype, "severity": severity})
-        print(f"  [{len(results)}] {fname}: {score:.2f} ({n_patches} patches) [{atype}/{severity}]")
+        print(f"  [{len(results)}] {fname}: {score:.4f} ({n_patches} patches) [{atype}/{severity}]")
 
     # ── Compute metrics ──
     if not results:

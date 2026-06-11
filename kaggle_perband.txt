@@ -1,14 +1,14 @@
 # ═══════════════════════════════════════════════════════════════════════════
-# KAGGLE PER-BAND FASTFLOW TRAINING NOTEBOOK
+# KAGGLE PER-BAND CAE TRAINING NOTEBOOK
 # ═══════════════════════════════════════════════════════════════════════════
 #
 # Instructions:
 #   1. Attach these Kaggle datasets:
 #      - "spectrum-npy-data" (your 228 .npy training files)
-#      - "fastflow"          (model.py from the repo)
+#      - "fastflow"          (model.py — now contains CAE, re-upload first!)
 #   2. Set BAND below to the band you want to train.
 #   3. Enable GPU (Settings → Accelerator → GPU T4 x2).
-#   4. Run all cells. Training takes ~1-3 hours depending on band size.
+#   4. Run all cells. Training takes ~30-60 min depending on band size.
 #   5. Download best.pt from the Output panel.
 #   6. Repeat for each band (FM, GSM, LTE, DAB, DVBT, TETRA).
 #
@@ -24,6 +24,8 @@ BAND = "FM"   # One of: FM, GSM, LTE, DAB, DVBT, TETRA
 # CELL 1: Setup & Imports
 # ═══════════════════════════════════════════════════════════════════════════
 
+!pip install pytorch-msssim -q
+
 import sys, os, re, gc, glob, json, time, math
 import numpy as np
 import torch
@@ -37,12 +39,11 @@ if not model_paths:
     raise FileNotFoundError("Could not find model.py in any attached dataset!")
 FASTFLOW_PATH = os.path.dirname(model_paths[0])
 sys.path.insert(0, FASTFLOW_PATH)
-from model import FastFlow
+from model import CAE, ReconstructionLoss
 
 # Find training data directory
 data_candidates = glob.glob('/kaggle/input/**/data', recursive=True)
 if not data_candidates:
-    # Fall back: search for any .npy files
     npy_files = glob.glob('/kaggle/input/**/*.npy', recursive=True)
     if not npy_files:
         raise FileNotFoundError("No .npy files found in /kaggle/input!")
@@ -72,15 +73,21 @@ print(f"Data   : {DATA_ROOT}")
 # ═══════════════════════════════════════════════════════════════════════════
 
 # Architecture
-FLOW_LAYERS = 16
-FLOW_HIDDEN = 128
+ENC_CHANNELS = (16, 32, 64, 32)
 
 # Training
-N_EPOCHS    = 50
-LR          = 1e-3
+N_EPOCHS     = 50
+LR           = 1e-3
 WEIGHT_DECAY = 1e-5
-GRAD_CLIP   = 1.0
-SAVE_EVERY  = 10
+GRAD_CLIP    = 1.0
+SSIM_WEIGHT  = 0.5
+SAVE_EVERY   = 10
+
+# Early stopping & LR schedule
+EARLY_STOP_PATIENCE = 15
+LR_PATIENCE  = 15
+LR_FACTOR    = 0.5
+MIN_LR       = 1e-6
 
 # Patching
 PATCH_H, PATCH_W = 32, 32
@@ -126,16 +133,6 @@ def extract_patches(arr):
             if (np.abs(p) >= CLIP_VAL - 1e-4).sum() / p.size <= MAX_EDGE_FRAC:
                 patches.append(p.copy())
     return np.stack(patches) if patches else np.empty((0, PATCH_H, PATCH_W), dtype=np.float32)
-
-
-class FastFlowDP(nn.Module):
-    """Thin wrapper so DataParallel calls forward() returning per-sample NLL."""
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-
-    def forward(self, x):
-        return self.model.flow.nll(x)  # (B,)
 
 
 def unwrap(m):
@@ -196,8 +193,7 @@ print(f"\nTotal patches: {all_patches.shape[0]:,} | Skipped: {skipped}")
 # CELL 4: Model & DataLoaders
 # ═══════════════════════════════════════════════════════════════════════════
 
-raw_model = FastFlow(flow_layers=FLOW_LAYERS, flow_hidden_ratio=float(FLOW_HIDDEN)).to(device)
-model = FastFlowDP(raw_model).to(device)
+model = CAE(enc_channels=ENC_CHANNELS).to(device)
 
 if n_gpus >= 2:
     model = nn.DataParallel(model)
@@ -207,11 +203,11 @@ else:
     BATCH = 256
     print(f"Single GPU mode — batch={BATCH}")
 
-total_params = sum(p.numel() for p in model.parameters())
-print(f"Total params: {total_params:,}")
+counts = unwrap(model).param_count()
+print(f"Params: {counts['total']:,} (enc: {counts['encoder']:,}, dec: {counts['decoder']:,})")
 
 # DataLoaders
-tensor = torch.from_numpy(all_patches)
+tensor = torch.from_numpy(all_patches).unsqueeze(1)  # (N, 1, 32, 32)
 del all_patches; gc.collect()
 
 n_val = max(1, int(VAL_FRACTION * len(tensor)))
@@ -222,11 +218,11 @@ train_ds, val_ds = random_split(
 )
 
 train_loader = DataLoader(train_ds, batch_size=BATCH, shuffle=True,
-                          num_workers=4, pin_memory=True, drop_last=True,
-                          persistent_workers=True, prefetch_factor=3)
+                          num_workers=4, pin_memory=False, drop_last=True,
+                          persistent_workers=True)
 val_loader = DataLoader(val_ds, batch_size=BATCH, shuffle=False,
-                        num_workers=4, pin_memory=True,
-                        persistent_workers=True, prefetch_factor=3)
+                        num_workers=4, pin_memory=False,
+                        persistent_workers=True)
 
 print(f"Train: {len(train_ds):,} | Val: {len(val_ds):,} | Batches/ep: {len(train_loader)}")
 
@@ -235,61 +231,63 @@ print(f"Train: {len(train_ds):,} | Val: {len(val_ds):,} | Batches/ep: {len(train
 # CELL 5: Sanity Check (3 quick epochs)
 # ═══════════════════════════════════════════════════════════════════════════
 
-raw = unwrap(model).model
-flow_pars = list(raw.parameters())
-test_opt = torch.optim.AdamW(flow_pars, lr=LR, weight_decay=WEIGHT_DECAY)
+test_model = CAE(enc_channels=ENC_CHANNELS).to(device)
+if n_gpus >= 2:
+    test_model = nn.DataParallel(test_model)
+
+test_criterion = ReconstructionLoss(ssim_weight=SSIM_WEIGHT)
+test_opt = torch.optim.Adam(test_model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
 # Use small subset for sanity check
 mini_train = list(train_loader)[:5]
 mini_val = list(val_loader)[:3]
 
 print(f"\nSanity check (3 epochs on {len(mini_train)} batches)...")
-print(f" Ep   Train NLL    Val NLL   grad_norm    Time")
-print("-" * 50)
+print(f" Ep   Train Loss   Val Loss   grad_norm    Time")
+print("-" * 55)
 
 passed = True
 for epoch in range(1, 4):
     t0 = time.time()
-    model.train()
+    test_model.train()
     train_loss, n_train, last_gnorm = 0.0, 0, 0.0
 
     for (patches,) in mini_train:
-        patches = patches.unsqueeze(1).to(device, non_blocking=True)
+        patches = patches.to(device, non_blocking=True)
         test_opt.zero_grad(set_to_none=True)
-        loss = model(patches).mean()
+        x_hat, _ = test_model(patches)
+        loss = test_criterion(x_hat, patches)
         if not torch.isfinite(loss):
             print("  !! non-finite — skipping"); continue
         loss.backward()
-        last_gnorm = nn.utils.clip_grad_norm_(flow_pars, 1.0).item()
+        last_gnorm = nn.utils.clip_grad_norm_(test_model.parameters(), 1.0).item()
         test_opt.step()
         train_loss += loss.item(); n_train += 1
 
-    model.eval()
+    test_model.eval()
     val_loss, n_val = 0.0, 0
     with torch.no_grad():
         for (patches,) in mini_val:
-            patches = patches.unsqueeze(1).to(device, non_blocking=True)
-            v = model(patches).mean()
+            patches = patches.to(device, non_blocking=True)
+            x_hat, _ = test_model(patches)
+            v = test_criterion(x_hat, patches)
             if torch.isfinite(v): val_loss += v.item(); n_val += 1
 
-    train_nll = train_loss / max(n_train, 1)
-    val_nll = val_loss / max(n_val, 1)
-    print(f"{epoch:>3}  {train_nll:>10.4f}  {val_nll:>9.4f}  "
+    train_avg = train_loss / max(n_train, 1)
+    val_avg = val_loss / max(n_val, 1)
+    print(f"{epoch:>3}  {train_avg:>10.6f}  {val_avg:>9.6f}  "
           f"{last_gnorm:>10.4f}  {time.time()-t0:>5.1f}s")
 
     if epoch == 1:
-        if val_nll <= -14.15:
-            print("  FAIL — collapsed to constant.")
-            passed = False; break
         if last_gnorm < 1e-6:
             print("  FAIL — grad_norm = 0.")
             passed = False; break
-        print(f"  OK: val_nll={val_nll:.4f}, grad_norm={last_gnorm:.4f}")
+        print(f"  OK: val_loss={val_avg:.6f}, grad_norm={last_gnorm:.4f}")
 
 if passed:
     print(f"\nPASSED — safe to run full training.")
 
-del mini_train, mini_val, test_opt
+del mini_train, mini_val, test_opt, test_model, test_criterion
 gc.collect(); torch.cuda.empty_cache()
 
 
@@ -297,22 +295,26 @@ gc.collect(); torch.cuda.empty_cache()
 # CELL 6: Full Training
 # ═══════════════════════════════════════════════════════════════════════════
 
-# Re-initialize optimizer (sanity check dirtied the weights)
-raw_model2 = FastFlow(flow_layers=FLOW_LAYERS, flow_hidden_ratio=float(FLOW_HIDDEN)).to(device)
-model2 = FastFlowDP(raw_model2).to(device)
+# Fresh model (sanity check dirtied the previous one)
+model2 = CAE(enc_channels=ENC_CHANNELS).to(device)
 if n_gpus >= 2:
     model2 = nn.DataParallel(model2)
 
-raw2 = unwrap(model2).model
-flow_params = list(raw2.parameters())
-optimizer = torch.optim.AdamW(flow_params, lr=LR, weight_decay=WEIGHT_DECAY)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS, eta_min=0)
+criterion = ReconstructionLoss(ssim_weight=SSIM_WEIGHT)
+optimizer = torch.optim.Adam(model2.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, mode="min", factor=LR_FACTOR,
+    patience=LR_PATIENCE, min_lr=MIN_LR
+)
 
 best_val = float("inf")
-history = {"train_nll": [], "val_nll": [], "lr": [], "epoch_time": []}
+epochs_no_improve = 0
+history = {"train_loss": [], "val_loss": [], "lr": [], "epoch_time": []}
 
 print(f"\nTraining [{BAND}]: {N_EPOCHS} epochs, LR={LR:.1e}, batch={BATCH}")
-print(f"\n Ep   Train NLL    Val NLL         LR     Time  Note")
+print(f"Architecture: CAE{ENC_CHANNELS}")
+print(f"Loss: MSE({1-SSIM_WEIGHT:.1f}) + SSIM({SSIM_WEIGHT:.1f})")
+print(f"\n Ep   Train Loss   Val Loss        LR     Time  Note")
 print("-" * 60)
 
 for epoch in range(1, N_EPOCHS + 1):
@@ -322,69 +324,84 @@ for epoch in range(1, N_EPOCHS + 1):
     model2.train()
     train_loss, n_train = 0.0, 0
     for (patches,) in train_loader:
-        patches = patches.unsqueeze(1).to(device, non_blocking=True)
+        patches = patches.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
-        loss = model2(patches).mean()
+        x_hat, _ = model2(patches)
+        loss = criterion(x_hat, patches)
         if not torch.isfinite(loss):
             continue
         loss.backward()
-        nn.utils.clip_grad_norm_(flow_params, GRAD_CLIP)
+        nn.utils.clip_grad_norm_(model2.parameters(), GRAD_CLIP)
         optimizer.step()
         train_loss += loss.item()
         n_train += 1
-
-    scheduler.step()
 
     # Validation
     model2.eval()
     val_loss, n_val = 0.0, 0
     with torch.no_grad():
         for (patches,) in val_loader:
-            patches = patches.unsqueeze(1).to(device, non_blocking=True)
-            v = model2(patches).mean()
+            patches = patches.to(device, non_blocking=True)
+            x_hat, _ = model2(patches)
+            v = criterion(x_hat, patches)
             if torch.isfinite(v):
                 val_loss += v.item()
                 n_val += 1
 
-    train_nll = train_loss / max(n_train, 1)
-    val_nll = val_loss / max(n_val, 1)
+    train_avg = train_loss / max(n_train, 1)
+    val_avg = val_loss / max(n_val, 1)
     epoch_time = time.time() - t0
     cur_lr = optimizer.param_groups[0]["lr"]
     note = ""
 
+    # LR scheduler
+    scheduler.step(val_avg)
+
     # Checkpoint
+    raw_model = unwrap(model2)
     ckpt_data = {
-        "band":        BAND,
-        "epoch":       epoch,
-        "val_nll":     val_nll,
-        "train_nll":   train_nll,
-        "model_state": raw2.state_dict(),
-        "arch":        {"flow_layers": FLOW_LAYERS, "flow_hidden_ratio": float(FLOW_HIDDEN)},
-        "norm_stats":  norm_stats,
-        "optimizer":   optimizer.state_dict(),
-        "scheduler":   scheduler.state_dict(),
+        "band":         BAND,
+        "epoch":        epoch,
+        "val_loss":     val_avg,
+        "train_loss":   train_avg,
+        "model_state":  raw_model.state_dict(),
+        "enc_channels": ENC_CHANNELS,
+        "norm_stats":   norm_stats,
+        "optimizer":    optimizer.state_dict(),
+        "scheduler":    scheduler.state_dict(),
     }
 
-    if val_nll < best_val:
-        best_val = val_nll
+    if val_avg < best_val:
+        best_val = val_avg
+        epochs_no_improve = 0
         torch.save(ckpt_data, OUT_DIR / "best.pt")
         note = "* best"
+    else:
+        epochs_no_improve += 1
 
     if epoch % SAVE_EVERY == 0:
         torch.save(ckpt_data, OUT_DIR / f"ckpt_ep{epoch:03d}.pt")
 
-    history["train_nll"].append(train_nll)
-    history["val_nll"].append(val_nll)
+    history["train_loss"].append(train_avg)
+    history["val_loss"].append(val_avg)
     history["lr"].append(cur_lr)
     history["epoch_time"].append(epoch_time)
 
-    print(f"{epoch:>3}  {train_nll:>10.4f}  {val_nll:>9.4f}  "
+    print(f"{epoch:>3}  {train_avg:>10.6f}  {val_avg:>9.6f}  "
           f"{cur_lr:>9.2e}  {epoch_time:>6.1f}s  {note}")
+
+    # Early stopping
+    if epochs_no_improve >= EARLY_STOP_PATIENCE:
+        print(f"\nEarly stopping — no improvement for {EARLY_STOP_PATIENCE} epochs.")
+        break
+
+    gc.collect()
+    torch.cuda.empty_cache()
 
 with open(OUT_DIR / "history.json", "w") as f:
     json.dump(history, f)
 
-print(f"\nDone. Best val NLL: {best_val:.4f}")
+print(f"\nDone. Best val loss: {best_val:.6f}")
 print(f"Avg epoch time: {np.mean(history['epoch_time']):.1f}s")
 
 
@@ -397,8 +414,9 @@ import shutil
 ckpt_path = OUT_DIR / "best.pt"
 if ckpt_path.exists():
     ckpt = torch.load(ckpt_path, map_location="cpu")
-    print(f"Best checkpoint: band={ckpt['band']}, epoch={ckpt['epoch']}, val_nll={ckpt['val_nll']:.4f}")
+    print(f"Best checkpoint: band={ckpt['band']}, epoch={ckpt['epoch']}, val_loss={ckpt['val_loss']:.6f}")
     print(f"Norm stats: median={ckpt['norm_stats']['median']:.2f}, iqr={ckpt['norm_stats']['iqr']:.2f}")
+    print(f"enc_channels: {ckpt['enc_channels']}")
     print(f"File size: {ckpt_path.stat().st_size / 1e6:.1f} MB")
     shutil.copy(ckpt_path, f"/kaggle/working/{BAND}_best.pt")
     print(f"Copied to /kaggle/working/{BAND}_best.pt — download from Output panel")

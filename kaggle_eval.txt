@@ -1,12 +1,12 @@
 # ═══════════════════════════════════════════════════════════════════════════
-# KAGGLE PER-BAND EVALUATION CELL
+# KAGGLE PER-BAND CAE EVALUATION CELL
 # ═══════════════════════════════════════════════════════════════════════════
 #
 # Run this AFTER training completes (or in a new session with the
 # checkpoint attached as a dataset).
 #
 # Prerequisites:
-#   - model.py accessible (same "fastflow" dataset from training)
+#   - model.py accessible (same dataset from training — now contains CAE)
 #   - Test data: attach your test set dataset containing normal/ and anomalous/
 #   - Checkpoint: either from the just-completed training output, or
 #     uploaded as a Kaggle dataset
@@ -14,6 +14,8 @@
 # ═══════════════════════════════════════════════════════════════════════════
 
 BAND = "FM"   # Must match the checkpoint you're evaluating
+
+!pip install pytorch-msssim -q
 
 import sys, os, re, gc, glob, json, math
 import numpy as np
@@ -27,15 +29,13 @@ model_paths = glob.glob('/kaggle/input/**/model.py', recursive=True)
 if not model_paths:
     raise FileNotFoundError("Could not find model.py! Attach the fastflow dataset.")
 sys.path.insert(0, os.path.dirname(model_paths[0]))
-from model import FastFlow
+from model import CAE
 
 # ── Find checkpoint ──
-# Priority: 1) just-trained output, 2) attached dataset
 ckpt_candidates = [
-    Path(f"/kaggle/working/checkpoints/best.pt"),        # from training cell
-    Path(f"/kaggle/working/{BAND}_best.pt"),              # copied output
+    Path(f"/kaggle/working/checkpoints/best.pt"),
+    Path(f"/kaggle/working/{BAND}_best.pt"),
 ]
-# Also search attached datasets
 ckpt_candidates += [Path(p) for p in glob.glob('/kaggle/input/**/*best*.pt', recursive=True)]
 
 CKPT_PATH = None
@@ -48,11 +48,9 @@ if CKPT_PATH is None:
     raise FileNotFoundError("No checkpoint found! Train first or attach checkpoint dataset.")
 
 # ── Find test data ──
-# Search for normal/ and anomalous/ directories
 test_normal_dirs = glob.glob('/kaggle/input/**/normal', recursive=True)
 test_anom_dirs = glob.glob('/kaggle/input/**/anomalous', recursive=True)
 
-# Filter to dirs that actually contain .npy files
 test_normal_dirs = [d for d in test_normal_dirs if glob.glob(os.path.join(d, '*.npy'))]
 test_anom_dirs = [d for d in test_anom_dirs if glob.glob(os.path.join(d, '*.npy'))]
 
@@ -108,7 +106,7 @@ def extract_patches(arr):
 
 
 def score_file(model, fpath, norm_stats, device, batch_size=1024):
-    """Score a single .npy file. Returns (file_score, n_patches) or None."""
+    """Score a single .npy file via reconstruction error."""
     arr = np.load(fpath).astype(np.float32)
     if arr.ndim != 2 or arr.shape[0] < 10 or arr.shape[1] < 2:
         return None
@@ -122,11 +120,10 @@ def score_file(model, fpath, norm_stats, device, batch_size=1024):
     with torch.no_grad():
         for b in range(0, len(patches_t), batch_size):
             batch = patches_t[b:b + batch_size]
-            batch_scores = model.anomaly_score(batch).cpu().numpy()
+            batch_scores = model.reconstruction_error(batch).cpu().numpy()
             scores_list.append(batch_scores)
 
     scores = np.concatenate(scores_list)
-    # Top-1% pooling (minimum 5 patches)
     k = max(5, int(0.01 * len(scores)))
     file_score = float(np.mean(np.sort(scores)[-k:]))
     return file_score, len(patches)
@@ -139,23 +136,16 @@ def score_file(model, fpath, norm_stats, device, batch_size=1024):
 print(f"\nLoading checkpoint: {CKPT_PATH}")
 ckpt = torch.load(CKPT_PATH, map_location=device, weights_only=False)
 
-flow_layers = ckpt.get("arch", {}).get("flow_layers", 16)
-flow_hidden = ckpt.get("arch", {}).get("flow_hidden_ratio", 128.0)
+enc_channels = tuple(ckpt.get("enc_channels", (16, 32, 64, 32)))
 norm_stats = ckpt["norm_stats"]
 
-print(f"  Epoch    : {ckpt.get('epoch', '?')}")
-print(f"  Val NLL  : {ckpt.get('val_nll', '?'):.4f}")
-print(f"  Norm     : median={norm_stats['median']:.2f}, iqr={norm_stats['iqr']:.2f}")
+print(f"  Epoch        : {ckpt.get('epoch', '?')}")
+print(f"  Val Loss     : {ckpt.get('val_loss', '?'):.6f}")
+print(f"  Norm         : median={norm_stats['median']:.2f}, iqr={norm_stats['iqr']:.2f}")
+print(f"  enc_channels : {enc_channels}")
 
-model = FastFlow(flow_layers=flow_layers, flow_hidden_ratio=flow_hidden)
-
-# Strip 'model.' prefix from DataParallel checkpoints
-state_dict = ckpt["model_state"]
-clean = {}
-for k, v in state_dict.items():
-    new_key = k.replace("model.", "") if k.startswith("model.") else k
-    clean[new_key] = v
-model.load_state_dict(clean)
+model = CAE(enc_channels=enc_channels)
+model.load_state_dict(ckpt["model_state"])
 model.to(device)
 model.eval()
 print("  Model loaded successfully.")
@@ -179,7 +169,7 @@ for fpath in band_normal:
     score, n_patches = result
     results.append({"filename": fpath.name, "label": 0, "score": score,
                      "n_patches": n_patches, "type": "normal", "severity": "none"})
-    print(f"  NORMAL  {score:>10.2f}  ({n_patches:>5} patches)  {fpath.name}")
+    print(f"  NORMAL  {score:>10.4f}  ({n_patches:>5} patches)  {fpath.name}")
 
 # ── Anomalous files ──
 anom_files = sorted(ANOM_DIR.glob("*.npy"))
@@ -199,7 +189,7 @@ for fpath in band_anom:
 
     results.append({"filename": fpath.name, "label": 1, "score": score,
                      "n_patches": n_patches, "type": atype, "severity": severity})
-    print(f"  ANOM    {score:>10.2f}  ({n_patches:>5} patches)  [{atype}/{severity}]  {fpath.name}")
+    print(f"  ANOM    {score:>10.4f}  ({n_patches:>5} patches)  [{atype}/{severity}]  {fpath.name}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -221,7 +211,7 @@ else:
         ap = average_precision_score(labels, scores)
 
         print(f"\n{'═' * 55}")
-        print(f"  [{BAND}] EVALUATION RESULTS")
+        print(f"  [{BAND}] CAE EVALUATION RESULTS")
         print(f"{'═' * 55}")
         print(f"  Normal files     : {n_normal}")
         print(f"  Anomalous files  : {n_anom}")
@@ -231,13 +221,13 @@ else:
         # Score distribution
         normal_scores = scores[labels == 0]
         anom_scores = scores[labels == 1]
-        print(f"\n  Score Distribution:")
-        print(f"    Normal    : mean={normal_scores.mean():.2f}, "
-              f"std={normal_scores.std():.2f}, "
-              f"range=[{normal_scores.min():.2f}, {normal_scores.max():.2f}]")
-        print(f"    Anomalous : mean={anom_scores.mean():.2f}, "
-              f"std={anom_scores.std():.2f}, "
-              f"range=[{anom_scores.min():.2f}, {anom_scores.max():.2f}]")
+        print(f"\n  Score Distribution (Reconstruction Error):")
+        print(f"    Normal    : mean={normal_scores.mean():.4f}, "
+              f"std={normal_scores.std():.4f}, "
+              f"range=[{normal_scores.min():.4f}, {normal_scores.max():.4f}]")
+        print(f"    Anomalous : mean={anom_scores.mean():.4f}, "
+              f"std={anom_scores.std():.4f}, "
+              f"range=[{anom_scores.min():.4f}, {anom_scores.max():.4f}]")
 
         # Per-severity breakdown
         print(f"\n  Per-Severity Breakdown:")
@@ -250,7 +240,7 @@ else:
                 sev_scores = scores[sev_mask]
                 subset = sev_mask | normal_mask
                 sev_auroc = roc_auc_score(labels[subset], scores[subset])
-                print(f"  {sev:<12} {sev_mask.sum():>6} {sev_scores.mean():>12.2f} {sev_auroc:>8.4f}")
+                print(f"  {sev:<12} {sev_mask.sum():>6} {sev_scores.mean():>12.4f} {sev_auroc:>8.4f}")
 
         # Per-attack-type breakdown
         print(f"\n  Per-Attack-Type Breakdown:")
@@ -263,7 +253,7 @@ else:
                 type_scores = scores[type_mask]
                 subset = type_mask | normal_mask
                 type_auroc = roc_auc_score(labels[subset], scores[subset])
-                print(f"  {atype:<22} {type_mask.sum():>6} {type_scores.mean():>12.2f} {type_auroc:>8.4f}")
+                print(f"  {atype:<22} {type_mask.sum():>6} {type_scores.mean():>12.4f} {type_auroc:>8.4f}")
 
         print(f"\n{'═' * 55}")
 

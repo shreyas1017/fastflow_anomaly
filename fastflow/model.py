@@ -1,170 +1,255 @@
 # =============================================================================
 # File    : fastflow/model.py
-# Purpose : FastFlow anomaly detection model for 2D spectrograms.
-#           Backbone: frozen ImageNet-pretrained ResNet-18 (adapted for 1-ch).
-#           Flow heads: two FlowBlock2D stacks operating on layer2 and layer3
-#           feature maps respectively.
+# Purpose : Convolutional Autoencoder (CAE) for 2D spectrogram patch
+#           anomaly detection via reconstruction error.
+#
+# Architecture (for 32×32 input):
+#   Input  : (B,  1, 32, 32)
+#   Enc 1  : (B, 16, 16, 16)  Conv2d(1→16,  3×3, stride=2, pad=1) + BN + LeakyReLU
+#   Enc 2  : (B, 32,  8,  8)  Conv2d(16→32, 3×3, stride=2, pad=1) + BN + LeakyReLU
+#   Enc 3  : (B, 64,  4,  4)  Conv2d(32→64, 3×3, stride=2, pad=1) + BN + LeakyReLU
+#   Enc 4  : (B, 32,  2,  2)  Conv2d(64→32, 3×3, stride=2, pad=1) + BN + LeakyReLU
+#            ── bottleneck: 32×2×2 = 128 values (8:1 compression) ──
+#   Dec 1  : (B, 64,  4,  4)  ConvTranspose2d + BN + ReLU
+#   Dec 2  : (B, 32,  8,  8)  ConvTranspose2d + BN + ReLU
+#   Dec 3  : (B, 16, 16, 16)  ConvTranspose2d + BN + ReLU
+#   Dec 4  : (B,  1, 32, 32)  ConvTranspose2d (linear output)
+#
+# Anomaly scoring:
+#   reconstruction_error(x) returns per-patch MSE.
+#   Higher MSE = more anomalous.
 #
 # DataParallel safety:
-#   Checkerboard masks are registered as non-persistent buffers.
-#   nn.DataParallel automatically replicates them to each GPU before
-#   forward() runs, so no .to(device) calls are needed inside forward().
+#   Fully convolutional — no buffers or device-specific state.
+#   nn.DataParallel works out of the box.
 # =============================================================================
 
-import math
 import torch
 import torch.nn as nn
-# ---------------------------------------------------------------------------
-# Note: The frozen ImageNet ResNet-18 backbone has been removed.
-# Spectrogram patches (1x32x32) are fed directly into the spatial FlowBlock2D.
-# ---------------------------------------------------------------------------
+from typing import Tuple
+import numpy as np
 
-# ---------------------------------------------------------------------------
-# Single affine coupling layer (2D, operates on spatial feature maps)
-# ---------------------------------------------------------------------------
 
-class AffineCouplingLayer2D(nn.Module):
+# ══════════════════════════════════════════════════════════════
+#  ENCODER BLOCK
+# ══════════════════════════════════════════════════════════════
+
+class EncoderBlock(nn.Module):
     """
-    Affine coupling layer for 2D feature maps.
+    One stride-2 encoder step: Conv2d → BatchNorm2d → LeakyReLU.
 
-    Splits spatial positions using a checkerboard mask passed at call time.
-    Scale/translate net uses alternating 3x3 / 1x1 convolutions (paper-spec).
+    Halves both spatial dimensions (H and W) via stride=2.
+    Uses padding=1 to ensure clean halving for even-sized inputs.
+
+    LeakyReLU(0.2) is used instead of ReLU to prevent dead neurons
+    in the encoder, which can cause flat regions in the latent space
+    and reduce anomaly score separation.
+
+    Parameters
+    ----------
+    in_ch  : Input channel count.
+    out_ch : Output channel count.
     """
 
-    def __init__(self, channels: int, hidden: int):
+    def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
-
-        # Alternating 3x3 / 1x1 conv, paper-spec lightweight net
-        self.net = nn.Sequential(
-            nn.Conv2d(channels, hidden, 3, padding=1),
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch,
+                      kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(hidden, hidden, 1),                    # 1x1 conv
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(hidden, channels * 2, 3, padding=1),  # outputs s and t
         )
-        # Init last conv to near-zero -> identity transform at epoch 0
-        nn.init.normal_(self.net[-1].weight, mean=0.0, std=0.01)
-        nn.init.zeros_(self.net[-1].bias)
-
-    def forward(self, x: torch.Tensor, mask: torch.Tensor):
-        """
-        x    : (B, C, H, W)
-        mask : (1, 1, H, W) binary -- 1 = pass-through, 0 = transform
-
-        Returns: (z, log_det)
-          z       : transformed tensor, same shape as x
-          log_det : per-sample scalar, shape (B,)
-        """
-        inv_mask = 1.0 - mask
-        x_masked = x * mask                     # pass-through half fed to net
-        st       = self.net(x_masked)
-        s, t     = st.chunk(2, dim=1)
-        s        = torch.tanh(s) * 2.0          # bound in (-2,2) -> exp(s) safe
-
-        # Transform inv_mask positions; pass-through positions unchanged
-        z       = x * mask + inv_mask * (x * torch.exp(s) + t)
-        log_det = (s * inv_mask).sum(dim=(1, 2, 3))  # (B,)
-        return z, log_det
-
-    def inverse(self, z: torch.Tensor, mask: torch.Tensor):
-        inv_mask = 1.0 - mask
-        z_masked = z * mask
-        st       = self.net(z_masked)
-        s, t     = st.chunk(2, dim=1)
-        s        = torch.tanh(s) * 2.0
-        x        = z * mask + inv_mask * ((z - t) * torch.exp(-s))
-        return x
-
-
-# ---------------------------------------------------------------------------
-# Flow block: stack of alternating coupling layers
-# ---------------------------------------------------------------------------
-
-class FlowBlock2D(nn.Module):
-    """
-    Stack of N affine coupling layers with alternating checkerboard masks,
-    operating on a 2D feature map of shape (B, C, H, W).
-
-    Masks are registered as non-persistent buffers:
-      - nn.DataParallel automatically replicates them to each GPU.
-      - They are NOT included in state_dict (no checkpoint issues).
-      - No .to(device) calls inside forward(), so fully thread-safe.
-    """
-
-    def __init__(self, channels: int, height: int, width: int,
-                 n_layers: int = 8, hidden: int = None):
-        super().__init__()
-        if hidden is None:
-            hidden = channels  # paper default: hidden == in_channels
-
-        self.layers = nn.ModuleList([
-            AffineCouplingLayer2D(channels, hidden) for _ in range(n_layers)
-        ])
-        self._expected_hw = (height, width)
-
-        # Build checkerboard masks on CPU; register as non-persistent buffers.
-        # DP will replicate them to each GPU before forward() is called.
-        xs = torch.arange(height).unsqueeze(1)
-        ys = torch.arange(width).unsqueeze(0)
-        base = ((xs + ys) % 2).float().unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
-        self.register_buffer('_mask0', base, persistent=False)
-        self.register_buffer('_mask1', 1.0 - base, persistent=False)
-
-    def forward(self, x: torch.Tensor):
-        """Returns (z, total_log_det) where total_log_det is (B,)."""
-        # Spatial shape guard
-        assert x.shape[2:] == torch.Size(self._expected_hw), (
-            f"FlowBlock2D got spatial {tuple(x.shape[2:])}, "
-            f"expected {self._expected_hw}. "
-            "Check backbone spatial output matches declared FEAT_SHAPE."
-        )
-        # _mask0, _mask1 are already on the correct device (DP replicates
-        # all buffers to each GPU before calling forward).
-        log_det_total = torch.zeros(x.shape[0], device=x.device)
-        z = x
-        for i, layer in enumerate(self.layers):
-            mask = self._mask1 if (i % 2 == 1) else self._mask0
-            z, ld = layer(z, mask)
-            log_det_total = log_det_total + ld
-        return z, log_det_total
-
-    def nll(self, x: torch.Tensor) -> torch.Tensor:
-        """Negative log-likelihood under the flow (per sample)."""
-        z, log_det = self.forward(x)
-        log_pz = -0.5 * (z ** 2 + math.log(2 * math.pi))
-        log_pz = log_pz.sum(dim=(1, 2, 3))   # sum over C, H, W
-        return -(log_pz + log_det)            # (B,)  NLL per sample
-
-
-# ---------------------------------------------------------------------------
-# FastFlow model — backbone + two parallel flow heads
-# ---------------------------------------------------------------------------
-
-class FastFlow(nn.Module):
-    """
-    FastFlow (Raw Spatial Version) for 2D spectrogram anomaly detection.
-
-    Architecture:
-      input (1×32×32 patches)
-        -> FlowBlock2D (n_layers=16, hidden=128) -> NLL
-        -> anomaly_score = NLL
-    """
-
-    def __init__(self, flow_layers: int = 16, flow_hidden_ratio: float = 128.0):
-        super().__init__()
-        
-        # We use flow_hidden_ratio to pass the explicit hidden size
-        hidden_dim = int(flow_hidden_ratio)
-        
-        # Input patches are 1 channel, 32x32
-        self.flow = FlowBlock2D(channels=1, height=32, width=32, 
-                                n_layers=flow_layers, hidden=hidden_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Returns mean NLL (scalar) — used for training loss."""
-        return self.flow.nll(x).mean()
+        return self.block(x)
 
-    @torch.no_grad()
-    def anomaly_score(self, x: torch.Tensor) -> torch.Tensor:
-        """Returns per-sample anomaly score (B,) — used for inference."""
-        return self.flow.nll(x)
+
+# ══════════════════════════════════════════════════════════════
+#  DECODER BLOCK
+# ══════════════════════════════════════════════════════════════
+
+class DecoderBlock(nn.Module):
+    """
+    One stride-2 decoder step: ConvTranspose2d → BatchNorm2d → ReLU.
+
+    Doubles both spatial dimensions via stride=2.
+    output_padding=1 is required to recover the exact spatial size
+    after a stride-2 conv on an even-sized input.
+
+    Parameters
+    ----------
+    in_ch      : Input channel count.
+    out_ch     : Output channel count.
+    activation : Whether to apply BN + ReLU after the transpose conv.
+                 Set to False for the final decoder layer (linear output).
+    """
+
+    def __init__(self, in_ch: int, out_ch: int, activation: bool = True):
+        super().__init__()
+
+        layers = [
+            nn.ConvTranspose2d(in_ch, out_ch,
+                               kernel_size=3, stride=2,
+                               padding=1, output_padding=1, bias=False),
+        ]
+
+        if activation:
+            layers += [
+                nn.BatchNorm2d(out_ch),
+                nn.ReLU(inplace=True),
+            ]
+
+        self.block = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
+# ══════════════════════════════════════════════════════════════
+#  FULL CAE
+# ══════════════════════════════════════════════════════════════
+
+class CAE(nn.Module):
+    """
+    Convolutional Autoencoder for 2D spectrogram patch reconstruction.
+
+    Trained exclusively on normal patches. At inference time,
+    anomalous patches produce higher reconstruction error (MSE) because
+    the model has only learned the distribution of normal spectral patterns.
+
+    Parameters
+    ----------
+    enc_channels : Tuple of ints defining the channel count at each
+                   encoder block. The decoder mirrors this in reverse.
+                   Default: (16, 32, 64, 32)
+
+    Input/Output
+    ------------
+    Both input and output have shape (B, 1, patch_h, patch_w).
+    Output is a linear (unbounded) reconstruction — no final activation.
+    The MSE between input and output is the anomaly score.
+
+    Design notes
+    ------------
+    - No linear/FC layers — the model is fully convolutional.
+      This keeps the parameter count low and avoids overfitting
+      to specific patch positions.
+    - BatchNorm in both encoder and decoder stabilises training
+      across the wide range of sensor types and band widths.
+    - Works with any even-sized input (32×32, 32×64, etc.)
+    """
+
+    def __init__(self, enc_channels: Tuple[int, ...] = (16, 32, 64, 32)):
+        super().__init__()
+
+        self.enc_channels = enc_channels
+
+        # ── Encoder ───────────────────────────────────────────
+        enc_blocks = [EncoderBlock(1, enc_channels[0])]
+        for i in range(1, len(enc_channels)):
+            enc_blocks.append(
+                EncoderBlock(enc_channels[i - 1], enc_channels[i])
+            )
+        self.encoder = nn.Sequential(*enc_blocks)
+
+        # ── Decoder ───────────────────────────────────────────
+        dec_channels = list(reversed(enc_channels))
+        dec_blocks = []
+        for i in range(len(dec_channels) - 1):
+            dec_blocks.append(
+                DecoderBlock(dec_channels[i], dec_channels[i + 1], activation=True)
+            )
+        # Final block: dec_channels[-1] → 1, no activation (linear output)
+        dec_blocks.append(
+            DecoderBlock(dec_channels[-1], 1, activation=False)
+        )
+        self.decoder = nn.Sequential(*dec_blocks)
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns the bottleneck representation z."""
+        return self.encoder(x)
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        """Reconstructs from bottleneck representation z."""
+        return self.decoder(z)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Full forward pass.
+
+        Returns
+        -------
+        x_hat : Reconstructed tensor, shape (B, 1, H, W).
+        z     : Bottleneck tensor (for logging/analysis).
+        """
+        z     = self.encode(x)
+        x_hat = self.decode(z)
+        return x_hat, z
+
+    def reconstruction_error(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Per-patch MSE between input and reconstruction.
+        Used at inference time for anomaly scoring.
+
+        Returns
+        -------
+        errors : 1D tensor of shape (B,), one MSE value per patch.
+        """
+        with torch.no_grad():
+            x_hat, _ = self.forward(x)
+            errors = ((x - x_hat) ** 2).mean(dim=[1, 2, 3])
+        return errors
+
+    def param_count(self) -> dict:
+        """Returns total, encoder, and decoder parameter counts."""
+        enc_params = sum(p.numel() for p in self.encoder.parameters())
+        dec_params = sum(p.numel() for p in self.decoder.parameters())
+        total      = enc_params + dec_params
+        return {
+            "total"  : total,
+            "encoder": enc_params,
+            "decoder": dec_params,
+        }
+
+
+# ══════════════════════════════════════════════════════════════
+#  RECONSTRUCTION LOSS
+# ══════════════════════════════════════════════════════════════
+
+class ReconstructionLoss(nn.Module):
+    """
+    Combined MSE + SSIM loss for CAE training.
+
+    MSE penalises pixel-level amplitude errors uniformly across the patch.
+    SSIM penalises structural changes — narrow spikes, wideband noise bursts,
+    tone insertions, power-level drifts — which produce only small MSE when
+    they affect a small fraction of patch pixels but disrupt local structure.
+
+    loss = (1 - ssim_weight) * MSE + ssim_weight * (1 - SSIM)
+
+    Parameters
+    ----------
+    ssim_weight : float
+        Contribution of the SSIM term. 0.0 = pure MSE, 1.0 = pure SSIM.
+    data_range : float
+        Value range of the input. For z-scored data clipped at ±5,
+        the range is 10.0.
+    """
+
+    def __init__(self, ssim_weight: float = 0.5, data_range: float = 10.0):
+        super().__init__()
+        from pytorch_msssim import SSIM as _SSIM
+        self.ssim_weight  = ssim_weight
+        self.mse_weight   = 1.0 - ssim_weight
+        self.mse          = nn.MSELoss(reduction='mean')
+        self.ssim_fn      = _SSIM(
+            data_range   = data_range,
+            size_average = True,
+            channel      = 1,
+            win_size     = 7,   # 7×7 fits cleanly in a 32×32 patch
+        )
+
+    def forward(self, x_hat: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        mse_loss  = self.mse(x_hat, x)
+        ssim_loss = 1.0 - self.ssim_fn(x_hat, x)
+        return self.mse_weight * mse_loss + self.ssim_weight * ssim_loss

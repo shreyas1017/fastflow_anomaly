@@ -42,11 +42,19 @@ sys.path.insert(0, FASTFLOW_PATH)
 from model import CAE, ReconstructionLoss
 
 # Find training data directory
-data_candidates = glob.glob('/kaggle/input/**/data', recursive=True)
+# Explicitly search for the 'spectrum-npy-data' folder to avoid picking up the test set
+data_candidates = glob.glob('/kaggle/input/**/spectrum-npy-data', recursive=True)
 if not data_candidates:
+    # Fallback to the old logic if the dataset was renamed
+    data_candidates = glob.glob('/kaggle/input/**/data', recursive=True)
+
+if not data_candidates:
+    # Filter out test-set directories if we have to guess based on .npy files
     npy_files = glob.glob('/kaggle/input/**/*.npy', recursive=True)
+    npy_files = [f for f in npy_files if 'test-set' not in f.lower()]
+    
     if not npy_files:
-        raise FileNotFoundError("No .npy files found in /kaggle/input!")
+        raise FileNotFoundError("Could not find the training dataset in /kaggle/input!")
     DATA_ROOT = Path(os.path.dirname(npy_files[0]))
 else:
     DATA_ROOT = Path(data_candidates[0])
